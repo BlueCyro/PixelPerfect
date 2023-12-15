@@ -80,21 +80,25 @@ public class PixelPerfect : ResoniteMod
 
 public class RenderCapturer : IDisposable
 {
+    // Max 5 frames processed at a time.
+    public const int MAX_FRAME_PROCESS_COUNT = 5;
     public static readonly Dictionary<RenderTextureProvider, RenderCapturer> caps = new();
+    
+    
     private readonly Sender sender;
     private readonly RenderTextureProvider provider;
     private RenderTexture pixelBuffer;
-    // private RenderTexture? lastTexture;
     private Task frameProcessor;
+    private readonly CancellationTokenSource tkSrc = new();
 
+    
     public int Width => provider.Size.Value.X;
     public int Height => provider.Size.Value.Y;
 
+    
     private readonly object lockObj = new object();
+    private BlockingCollection<(VideoFrame frame, NativeArray<byte> buffer)> queuedFrames = new(MAX_FRAME_PROCESS_COUNT);
 
-    private readonly CancellationTokenSource tkSrc = new();
-
-    private BlockingCollection<(VideoFrame frame, NativeArray<byte> buffer)> queuedFrames = new(5);
 
     public RenderCapturer(RenderTextureProvider tex)
     {
@@ -107,7 +111,7 @@ public class RenderCapturer : IDisposable
         pixelBuffer = new(Width, Height, 0, RenderTextureFormat.BGRA32);
         // buf = new(Width * Height * 4, Allocator.Persistent);
 
-        frameProcessor = Task.Run(ProcessFrames);
+        frameProcessor = Task.Run(ProcessFrames, tkSrc.Token);
         PixelPerfect.Update += UpdateNDI;
         tex.Destroyed += d => Dispose();
 
@@ -124,8 +128,11 @@ public class RenderCapturer : IDisposable
         {
             foreach (var (frame, buffer) in queuedFrames.GetConsumingEnumerable())
             {
-                sender.Send(frame);
-                buffer.Dispose();
+                lock (lockObj)
+                {
+                    sender.Send(frame);
+                    buffer.Dispose();
+                }
             }
             PixelPerfect.Msg("Frame processing cancelled gracefully!");
         }
@@ -170,8 +177,8 @@ public class RenderCapturer : IDisposable
             pixelBuffer.Release();
             pixelBuffer = new(Width, Height, 0, RenderTextureFormat.BGRA32);
 
-            queuedFrames = new BlockingCollection<(VideoFrame frame, NativeArray<byte> buffer)>(5);
-            frameProcessor = Task.Run(ProcessFrames);
+            queuedFrames = new BlockingCollection<(VideoFrame frame, NativeArray<byte> buffer)>(MAX_FRAME_PROCESS_COUNT);
+            frameProcessor = Task.Run(ProcessFrames, tkSrc.Token);
             // buf.Dispose();
             // buf = new(Width * Height * 4, Allocator.Persistent);
         }
@@ -179,37 +186,40 @@ public class RenderCapturer : IDisposable
 
     private unsafe void Callback(AsyncGPUReadbackRequest req, RenderTexture tex)
     {
-        if (!TryGetRenderTexture(out var curTex) || curTex != tex)
-            return;
-        
-        var buf = req.GetData<byte>();
-        IntPtr ptr = (IntPtr)buf.GetUnsafePtr();
-        int stride = (Width * 32 + 7) / 8;
+        lock (lockObj)
+        {
+            if (!TryGetRenderTexture(out var curTex) || curTex != tex || queuedFrames.Count == MAX_FRAME_PROCESS_COUNT)
+                return;
+            
+            var buf = req.GetData<byte>();
+            IntPtr ptr = (IntPtr)buf.GetUnsafePtr();
+            int stride = (Width * 32 + 7) / 8;
 
-        using VideoFrame frame = new
-        (
-            ptr,
-            Width,
-            Height,
-            stride,
-            NDIlib.FourCC_type_e.FourCC_type_BGRA,
-            (float)Width / Height,
-            60,
-            1,
-            NDIlib.frame_format_type_e.frame_format_type_progressive
-        );
-        queuedFrames.Add((frame, buf));
+            using VideoFrame frame = new
+            (
+                ptr,
+                Width,
+                Height,
+                stride,
+                NDIlib.FourCC_type_e.FourCC_type_BGRA,
+                (float)Width / Height,
+                60,
+                1,
+                NDIlib.frame_format_type_e.frame_format_type_progressive
+            );
+            queuedFrames.Add((frame, buf));
+        }
     }
 
     public void Dispose()
     {
+        tkSrc.Cancel();
+        queuedFrames.CompleteAdding();
+
         PixelPerfect.Update -= UpdateNDI;
         pixelBuffer.Release();
         caps.Remove(provider);
         
-        tkSrc.Cancel();
-        queuedFrames.CompleteAdding();
-
         try
         {
             frameProcessor.Wait();
