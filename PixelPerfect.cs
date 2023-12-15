@@ -66,8 +66,28 @@ public class PixelPerfect : ResoniteMod
             {
                 try
                 {
-                    if (__instance.Slot.Tag == "PixelPerfect.CaptureDevice")
-                        RenderCapturer.Register(__instance);
+                    ISyncMember? tagField = __instance.GetSyncMember("tag");
+                    if (tagField == null)
+                        return;
+
+                    void Changed(IChangeable c)
+                    {
+                        if (__instance.Slot.Tag == "PixelPerfect.CaptureDevice")
+                            RenderCapturer.Register(__instance);
+                        else
+                            RenderCapturer.Unregister(__instance);
+                    }
+
+                    void Destroyed(IDestroyable d)
+                    {
+                        RenderCapturer.Unregister(__instance);
+                        tagField.Changed -= Changed;
+                        __instance.Slot.Destroyed -= Destroyed;
+                    }
+
+                    tagField.Changed += Changed;
+                    __instance.Slot.Destroyed += Destroyed;
+                    
                 }
                 catch (Exception e)
                 {
@@ -114,12 +134,19 @@ public class RenderCapturer : IDisposable
         frameProcessor = Task.Run(ProcessFrames, tkSrc.Token);
         PixelPerfect.Update += UpdateNDI;
         tex.Destroyed += d => Dispose();
-
     }
 
     public static void Register(RenderTextureProvider prov)
     {
         caps.Add(prov, new(prov));
+    }
+
+    public static void Unregister(RenderTextureProvider prov)
+    {
+        if (caps.TryGetValue(prov, out RenderCapturer cap))
+        {
+            cap.Dispose();
+        }
     }
 
     private void ProcessFrames()
@@ -128,11 +155,8 @@ public class RenderCapturer : IDisposable
         {
             foreach (var (frame, buffer) in queuedFrames.GetConsumingEnumerable())
             {
-                lock (lockObj)
-                {
-                    sender.Send(frame);
-                    buffer.Dispose();
-                }
+                sender.Send(frame);
+                buffer.Dispose();
             }
             PixelPerfect.Msg("Frame processing cancelled gracefully!");
         }
@@ -210,16 +234,16 @@ public class RenderCapturer : IDisposable
             queuedFrames.Add((frame, buf));
         }
     }
-
+    
     public void Dispose()
     {
-        tkSrc.Cancel();
         queuedFrames.CompleteAdding();
+        tkSrc.Cancel();
 
         PixelPerfect.Update -= UpdateNDI;
         pixelBuffer.Release();
         caps.Remove(provider);
-        
+
         try
         {
             frameProcessor.Wait();
@@ -228,7 +252,12 @@ public class RenderCapturer : IDisposable
         {
             ex.Handle(e => e is TaskCanceledException);
         }
-        tkSrc.Dispose();
+        finally
+        {
+            tkSrc.Dispose();
+            sender.Dispose();
+            PixelPerfect.Msg("Render capturer disposed of successfully!");
+        }
     }
 }
 
