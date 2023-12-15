@@ -1,0 +1,3 @@
+✨🎨 Pixel Perfect: Capture your moment, perfectly
+
+Pixel Perfect is a mod for [Resonite](https://resonite.com) via [ResoniteModLoader](https://github.com/resonite-modding-group/ResoniteModLoader) which allows you to output pixel buffers directly from Render Textures out of the game via [NDI](https://en.wikipedia.org/wiki/Network_Device_Interface), and can be directly used in software like [OBS](https://obsproject.com/) directly!
