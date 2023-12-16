@@ -1,16 +1,13 @@
 ﻿using HarmonyLib;
 using ResoniteModLoader;
 using FrooxEngine;
-using NewTek.NDI;
-using NewTek;
-using UnityEngine;
 using Camera = FrooxEngine.Camera;
 using Texture2D = UnityEngine.Texture2D;
-using RenderTexture = UnityEngine.RenderTexture;
-using UnityEngine.Rendering;
-using Unity.Collections;
-using Unity.Collections.LowLevel.Unsafe;
 using UnityFrooxEngineRunner;
+using System.Reflection.Emit;
+using System.Reflection;
+using UnityEngine;
+using RenderTexture = UnityEngine.RenderTexture;
 using System.Collections.Concurrent;
 
 namespace PixelPerfect;
@@ -32,6 +29,10 @@ public class PixelPerfect : ResoniteMod
         Config?.Save(true);
         harmony.PatchAll();
 
+        MethodInfo RTCUpdate = typeof(RenderTextureConnector).GetNestedType("<>c__DisplayClass15_0", AccessTools.all).GetMethod("<Update>b__0", AccessTools.all);
+        MethodInfo Detour = AccessTools.Method(typeof(PixelPerfect_Patches), "Update_Patch");
+        harmony.Patch(RTCUpdate, transpiler: new(Detour));
+
         Engine.Current.RunPostInit(() =>
         {
             DevCreateNewForm.AddAction("NDI", "Capture camera", s =>
@@ -41,7 +42,6 @@ public class PixelPerfect : ResoniteMod
                 s.OpenInspectorForTarget();
                 var cam = s.AttachComponent<Camera>();
                 var tex = s.AttachComponent<RenderTextureProvider>();
-                tex.Depth.Value = 32;
                 tex.Size.Value = new(512, 512);
                 cam.RenderTexture.Target = tex;
             });
@@ -49,7 +49,7 @@ public class PixelPerfect : ResoniteMod
     }
 
     [HarmonyPatch]
-    public static class Patch_RunUpdates
+    public static class PixelPerfect_Patches
     {
         [HarmonyPatch(typeof(UpdateManager), "RunUpdates")]
         [HarmonyPostfix]
@@ -58,15 +58,16 @@ public class PixelPerfect : ResoniteMod
             Update?.Invoke(null, EventArgs.Empty);
         }
 
+
         [HarmonyPatch(typeof(RenderTextureProvider), "OnAwake")]
         [HarmonyPostfix]
         public static void OnAwake_Postfix(RenderTextureProvider __instance)
         {
-            __instance.RunSynchronously(() =>
+            __instance.RunInUpdates(8, () =>
             {
                 try
                 {
-                    ISyncMember? tagField = __instance.GetSyncMember("tag");
+                    ISyncMember? tagField = __instance.Slot.GetSyncMember("Tag");
                     if (tagField == null)
                         return;
 
@@ -88,6 +89,10 @@ public class PixelPerfect : ResoniteMod
                     tagField.Changed += Changed;
                     __instance.Slot.Destroyed += Destroyed;
                     
+                    if (__instance.Slot.Tag == "PixelPerfect.CaptureDevice")
+                    {
+                        RenderCapturer.Register(__instance);
+                    }
                 }
                 catch (Exception e)
                 {
@@ -95,257 +100,73 @@ public class PixelPerfect : ResoniteMod
                 }
             });
         }
+
+
+
+
+        // This is extremely very brittle and terrible. Don't do this if you can help it, kids.
+        public static IEnumerable<CodeInstruction> Update_Patch(IEnumerable<CodeInstruction> instructions)
+        {
+            var codes = instructions.ToList();
+            var constructors = typeof(RenderTexture).GetConstructors();
+            for (int i = 0; i < codes.Count - 1; i++)
+            {
+                CodeInstruction inst = codes[i];
+                CodeInstruction next = codes[i + 1];
+                
+                if (inst.opcode == OpCodes.Ldc_I4_2 && 
+                    next.opcode == OpCodes.Newobj &&
+                    constructors.Contains(next.operand as ConstructorInfo)
+                )
+                {
+                    PixelPerfect.Msg($"Found {codes[i]} at index {i}! Replacing with detour!");
+                    var connectorInfo =
+                        codes.Select(c => c.operand as FieldInfo)
+                        .FirstOrDefault(f => f?.FieldType == typeof(RenderTextureConnector));
+                    
+                    if (connectorInfo == null)
+                    {
+                        PixelPerfect.Msg("Can't find connector reference! Aborting!");
+                        return codes;
+                    }
+                    codes[i] = new(OpCodes.Call, typeof(PixelPerfect_Patches).GetMethod("Format_Detour"));
+                    codes.InsertRange(i, new List<CodeInstruction>
+                    {
+                        new(OpCodes.Ldarg_0),
+                        new(OpCodes.Ldfld, connectorInfo)
+                    });
+                    break;
+                }
+            }
+            return codes;
+        }
+
+        public static RenderTextureFormat Format_Detour(RenderTextureConnector connector)
+        {
+            PixelPerfect.Msg($"Setting texture to: {(connector.IsMarked() ? "BGRA" : "ARGBHalf")}");
+            return connector.IsMarked() ? RenderTextureFormat.BGRA32 : RenderTextureFormat.ARGBHalf;
+        }
     }
 }
 
-public class RenderCapturer : IDisposable
+public static class RenderTextureFormatExtensions
 {
-    // Max 5 frames processed at a time.
-    public const int MAX_FRAME_PROCESS_COUNT = 5;
-    public static readonly Dictionary<RenderTextureProvider, RenderCapturer> caps = new();
-    
-    
-    private readonly Sender sender;
-    private readonly RenderTextureProvider provider;
-    private RenderTexture pixelBuffer;
-    private Task frameProcessor;
-    private readonly CancellationTokenSource tkSrc = new();
+    internal static readonly ConcurrentDictionary<IRenderTextureConnector, bool> bgra_marked = new();
 
-    
-    public int Width => provider.Size.Value.X;
-    public int Height => provider.Size.Value.Y;
-
-    
-    private readonly object lockObj = new object();
-    private BlockingCollection<(VideoFrame frame, NativeArray<byte> buffer)> queuedFrames = new(MAX_FRAME_PROCESS_COUNT);
-
-
-    public RenderCapturer(RenderTextureProvider tex)
+    public static void MarkBGRA(this IRenderTextureConnector connector)
     {
-        string name = tex.ReferenceID.ToString();
-        PixelPerfect.Msg($"Initializing capture device \"{tex.Slot.Name}\"!");
-        provider = tex;
-        sender = new(tex.Slot.Name, false);
-        PixelPerfect.Msg($"Registering frame from buffer ({Width}, {Height})");
-
-        pixelBuffer = new(Width, Height, 0, RenderTextureFormat.BGRA32);
-        // buf = new(Width * Height * 4, Allocator.Persistent);
-
-        frameProcessor = Task.Run(ProcessFrames, tkSrc.Token);
-        PixelPerfect.Update += UpdateNDI;
-        tex.Destroyed += d => Dispose();
+        PixelPerfect.Msg("Registering connector for BGRA!");
+        bgra_marked.TryAdd(connector, true);
     }
 
-    public static void Register(RenderTextureProvider prov)
+    public static void Unmark(this IRenderTextureConnector connector)
     {
-        caps.Add(prov, new(prov));
+        PixelPerfect.Msg("Unregistering connector!");
+        bgra_marked.TryRemove(connector, out _);
     }
 
-    public static void Unregister(RenderTextureProvider prov)
+    public static bool IsMarked(this IRenderTextureConnector connector)
     {
-        if (caps.TryGetValue(prov, out RenderCapturer cap))
-        {
-            cap.Dispose();
-        }
-    }
-
-    private void ProcessFrames()
-    {
-        try
-        {
-            foreach (var (frame, buffer) in queuedFrames.GetConsumingEnumerable())
-            {
-                sender.Send(frame);
-                buffer.Dispose();
-            }
-            PixelPerfect.Msg("Frame processing cancelled gracefully!");
-        }
-        catch (OperationCanceledException ex)
-        {
-            PixelPerfect.Msg($"Frame processing cancelled! Message: {ex.Message}");
-        }
-    }
-
-    public void UpdateNDI(object? s, EventArgs args)
-    {
-        if (TryGetRenderTexture(out var tex) && provider.Depth.Value == 32)
-        {
-            if (pixelBuffer.width * pixelBuffer.height * 4 != Width * Height * 4)
-            {
-                PixelPerfect.Msg($"Pixel buffer mismatch! Registering new buffer of size: {Width}, {Height}");
-                RegisterBuffer();
-                return;
-            }
-
-            lock (lockObj)
-            {
-                Graphics.Blit(tex, pixelBuffer);
-                AsyncGPUReadback.Request(pixelBuffer, 0, req => Callback(req, tex));
-            }
-        }
-    }
-
-    public bool TryGetRenderTexture(out RenderTexture tex)
-    {
-        tex = (provider.Asset?.Connector as RenderTextureConnector)?.RenderTexture!;
-        return tex != null;
-    }
-
-    public void RegisterBuffer()
-    {
-        lock (lockObj)
-        {
-            queuedFrames.CompleteAdding();
-            frameProcessor.Wait();
-
-            pixelBuffer.Release();
-            pixelBuffer = new(Width, Height, 0, RenderTextureFormat.BGRA32);
-
-            queuedFrames = new BlockingCollection<(VideoFrame frame, NativeArray<byte> buffer)>(MAX_FRAME_PROCESS_COUNT);
-            frameProcessor = Task.Run(ProcessFrames, tkSrc.Token);
-            // buf.Dispose();
-            // buf = new(Width * Height * 4, Allocator.Persistent);
-        }
-    }
-
-    private unsafe void Callback(AsyncGPUReadbackRequest req, RenderTexture tex)
-    {
-        lock (lockObj)
-        {
-            if (!TryGetRenderTexture(out var curTex) || curTex != tex || queuedFrames.Count == MAX_FRAME_PROCESS_COUNT)
-                return;
-            
-            var buf = req.GetData<byte>();
-            IntPtr ptr = (IntPtr)buf.GetUnsafePtr();
-            int stride = (Width * 32 + 7) / 8;
-
-            using VideoFrame frame = new
-            (
-                ptr,
-                Width,
-                Height,
-                stride,
-                NDIlib.FourCC_type_e.FourCC_type_BGRA,
-                (float)Width / Height,
-                60,
-                1,
-                NDIlib.frame_format_type_e.frame_format_type_progressive
-            );
-            queuedFrames.Add((frame, buf));
-        }
-    }
-    
-    public void Dispose()
-    {
-        queuedFrames.CompleteAdding();
-        tkSrc.Cancel();
-
-        PixelPerfect.Update -= UpdateNDI;
-        pixelBuffer.Release();
-        caps.Remove(provider);
-
-        try
-        {
-            frameProcessor.Wait();
-        }
-        catch(AggregateException ex)
-        {
-            ex.Handle(e => e is TaskCanceledException);
-        }
-        finally
-        {
-            tkSrc.Dispose();
-            sender.Dispose();
-            PixelPerfect.Msg("Render capturer disposed of successfully!");
-        }
+        return bgra_marked.ContainsKey(connector);
     }
 }
-
-/*
-public static class VideoSender
-{
-    public static bool init = false;
-    private static readonly Sender sender = new("Pixel-Perfect", false);
-    private static RenderTexture? temp;
-    private static RenderTexture? from;
-    private static NativeArray<byte> buf;
-    private static readonly object _lock = new();
-
-    public static void SetTexture(UnityEngine.Camera cam)
-    {
-        lock (_lock)
-        {
-            var tex = cam.targetTexture;
-            from = tex;
-            temp = new(tex.width, tex.height, 32, RenderTextureFormat.BGRA32);
-            
-            buf = new(tex.width * tex.height * 4, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
-        }
-    }
-
-    public static void UnsetTexture()
-    {
-        lock (_lock)
-        {
-            buf.Dispose();
-            temp = null;
-        }
-    }
-
-    public static void SendFrame()
-    {
-        // PixelPerfect.Msg("Setting render texture");
-
-        // ScreenCapture.CaptureScreenshotIntoRenderTexture(temp);
-
-        // PixelPerfect.Msg("Requesting GPU readback...");
-        lock (_lock)
-        {
-            if (temp == null)
-                return;
-            
-            Graphics.Blit(from, temp);
-            AsyncGPUReadback.RequestIntoNativeArray(ref buf, temp, 0, Callback);
-            // flag = true;
-        }
-
-        // PixelPerfect.Msg("Setting render texture back");
-    }
-    public static void GPURequest(AsyncGPUReadbackRequest req)
-    {
-        if (req.hasError)
-        {
-            PixelPerfect.Msg("Async GPU readback failed!");
-            return;
-        }
-        Task.Run(() => Callback(req)).ConfigureAwait(false);
-    }
-
-    public static unsafe void Callback(AsyncGPUReadbackRequest req)
-    {
-        lock (_lock)
-        {
-            if (temp == null)
-                return;
-            
-            IntPtr ptr = (IntPtr)req.GetData<byte>().GetUnsafePtr();
-            int stride = (temp.width * 32 + 7) / 8;
-
-            using VideoFrame frame = new
-            (
-                ptr,
-                temp.width,
-                temp.height,
-                stride,
-                NDIlib.FourCC_type_e.FourCC_type_BGRA,
-                (float)temp.width / temp.height,
-                60,
-                1,
-                NDIlib.frame_format_type_e.frame_format_type_progressive
-            );
-
-            sender.Send(frame);
-        }
-    }
-}
-*/
