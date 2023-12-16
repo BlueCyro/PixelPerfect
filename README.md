@@ -17,3 +17,9 @@ To instantiate a capture device:
 - Attach a RenderTextureProvider to a slot and make sure the tag is set to `PixelPerfect.CaptureDevice`.
 - Name the slot whatever you wish - this will automatically regenerate the capture device each time the slot name is changed.
 - If using OBS, make sure you have [obs-ndi](https://obsproject.com/forum/resources/obs-ndi-newtek-ndi%E2%84%A2-integration-into-obs-studio.528/) installed, then simply make a new NDI source.
+
+# DISCLAIMER!
+
+**This project is still very much under development, and as a result implementation details could change at any time!**
+
+Furthermore, the resolution is clamped to the equivelant pixel count of 1920 * 1080, as any more causes stuttering and crashes. Hopefully this is remediable in the future.
