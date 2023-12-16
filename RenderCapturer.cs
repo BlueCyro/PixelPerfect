@@ -152,12 +152,16 @@ public class RenderCapturer : IDisposable
 
 
     /// <summary>
-    /// Update loop event for updating the NDI streams each frame.
+    /// Update loop event for updating the NDI stream each frame.
     /// </summary>
     /// <param name="s">Nothing</param>
     /// <param name="args">Empty</param>
     private void UpdateNDI(object? s, EventArgs args)
     {
+        // Hard clamping to no more pixels than the equivelant of 1920x1080. Any more is impractical for realtime CPU encoding in this setup. :/
+        if (Width * Height > 2073600)
+            return;
+        
         ticker.Set(); // Nudge the ticker in case the send loop is stalled waiting for the next request.
         try
         {
