@@ -1,55 +1,64 @@
-using FrooxEngine;
-using NewTek.NDI;
 using NewTek;
-using UnityEngine;
-using RenderTexture = UnityEngine.RenderTexture;
+using NewTek.NDI;
+using FrooxEngine;
 using UnityEngine.Rendering;
-using Unity.Collections;
-using Unity.Collections.LowLevel.Unsafe;
 using UnityFrooxEngineRunner;
 using System.Collections.Concurrent;
+using Unity.Collections.LowLevel.Unsafe;
+using RenderTexture = UnityEngine.RenderTexture;
 
 namespace PixelPerfect;
 
 public class RenderCapturer : IDisposable
 {
-    // Max 5 frames processed at a time.
+    // Max 5 frames processed at a time. Can get jerky if the frames aren't coming in fast enough.
     public const int MAX_FRAME_PROCESS_COUNT = 5;
     public static readonly Dictionary<RenderTextureProvider, RenderCapturer> caps = new();
     
     
+
     private readonly Sender sender;
     private readonly RenderTextureProvider provider;
-    private RenderTexture pixelBuffer;
+    private RenderTexture? lastTex;
     private Task frameProcessor;
-    private readonly CancellationTokenSource tkSrc = new();
     private readonly AutoResetEvent ticker = new(false);
+    private BlockingCollection<(AsyncGPUReadbackRequest req, RenderTexture tex, int width, int height)> queuedFrames = new(/* MAX_FRAME_PROCESS_COUNT */);
 
     
+
     public int Width => provider.Size.Value.X;
     public int Height => provider.Size.Value.Y;
 
-    
-    private readonly object lockObj = new object();
-    private BlockingCollection<(AsyncGPUReadbackRequest req, RenderTexture tex, int width, int height)> queuedFrames = new(/* MAX_FRAME_PROCESS_COUNT */);
 
 
     private RenderCapturer(RenderTextureProvider tex)
     {
-        string name = tex.ReferenceID.ToString();
-        PixelPerfect.Msg($"Initializing capture device \"{tex.Slot.Name}\"!");
+        PixelPerfect.Msg($"Initializing capture device on slot: \"{tex.Slot.Name}\"!");
+
+
+        // Store the provider and make a new NDI sender.
         provider = tex;
         sender = new(tex.Slot.Name, false);
+
         PixelPerfect.Msg($"Registering frame from buffer ({Width}, {Height})");
 
-        pixelBuffer = new(Width, Height, 0, RenderTextureFormat.BGRA32);
-        // buf = new(Width * Height * 4, Allocator.Persistent);
 
-        frameProcessor = Task.Run(ProcessFrames, tkSrc.Token);
+        if (TryGetRenderTexture(out var curTex))
+            lastTex = curTex;
+
+
+        // Make a new frame processor, subscribe to the update event, and make sure to dispose the object if the provider is destroyed.
+        frameProcessor = Task.Run(ProcessFrames);
         PixelPerfect.Update += UpdateNDI;
         tex.Destroyed += d => Dispose();
     }
 
+
+
+    /// <summary>
+    /// Registers a texture provider for frame capture and sets it to the proper pixel format.
+    /// </summary>
+    /// <param name="prov"></param>
     public static void Register(RenderTextureProvider prov)
     {
         var asset = prov.Asset;
@@ -58,6 +67,12 @@ public class RenderCapturer : IDisposable
         caps.Add(prov, new(prov));
     }
 
+
+
+    /// <summary>
+    /// Unregisters a render texture for frame capture and sets it back to the correct format.
+    /// </summary>
+    /// <param name="prov"></param>
     public static void Unregister(RenderTextureProvider prov)
     {
         if (caps.TryGetValue(prov, out RenderCapturer cap))
@@ -66,34 +81,47 @@ public class RenderCapturer : IDisposable
         }
     }
 
+
+
+    /// <summary>
+    /// Asynchronously processes each frame in the order it was queued.
+    /// </summary>
     private unsafe void ProcessFrames()
     {
         try
         {
             while (!queuedFrames.IsAddingCompleted)
             {
+                // Take from the queue
                 var (req, tex, width, height) = queuedFrames.Take();
                 
+                
+                // Block the thread on the current request until it's done to ensure order.
                 while (!req.done)
                 {
-                    ticker.WaitOne();
+                    ticker.WaitOne(); // Wait for a tick from the update loop.
                     if (queuedFrames.IsAddingCompleted)
-                        return;
+                        return; // Just abort if the adding is completed at this stage.
                 }
- 
+
+                
+                // Make sure the texture isn't null and isn't different from the old one, this indicates that the data is probably bad.
                 if (!TryGetRenderTexture(out RenderTexture curTex) || curTex != tex)
                     continue;
                 
-                if (req.hasError)
-                {
-                    // PixelPerfect.Msg($"Error with request: {req}");
+                if (req.hasError) // Just continue, this has no verbose response so I can't even print the error anyways. It seems to work fine. I think.
                     continue;
-                }
 
+                
+
+                // Get the data and some scary pointers to send the frame.
                 using var buf = req.GetData<byte>();
                 IntPtr ptr = (IntPtr)buf.GetUnsafePtr();
                 int stride = (width * 32 + 7) / 8;
 
+                
+
+                // New frame with bogus frame timing since this is unclocked.
                 using VideoFrame frame = new
                 (
                     ptr,
@@ -106,6 +134,7 @@ public class RenderCapturer : IDisposable
                     1,
                     NDIlib.frame_format_type_e.frame_format_type_progressive
                 );
+                // Send the frame. The 'using' statements above will ensure the allocated resources are freed once the scope ends.
                 sender.Send(frame);
             }
             PixelPerfect.Msg("Frame processing cancelled gracefully!");
@@ -120,24 +149,31 @@ public class RenderCapturer : IDisposable
         }
     }
 
-    public void UpdateNDI(object? s, EventArgs args)
+
+
+    /// <summary>
+    /// Update loop event for updating the NDI streams each frame.
+    /// </summary>
+    /// <param name="s">Nothing</param>
+    /// <param name="args">Empty</param>
+    private void UpdateNDI(object? s, EventArgs args)
     {
-        ticker.Set();
+        ticker.Set(); // Nudge the ticker in case the send loop is stalled waiting for the next request.
         try
         {
-            if (TryGetRenderTexture(out var tex))
+            if (TryGetRenderTexture(out var tex)) // Make sure the texture actually exists
             {
-                if (pixelBuffer.width * pixelBuffer.height * 4 != Width * Height * 4)
+                if (lastTex != tex)
                 {
+                    // Screech to a halt if the render texture is mismatched. We've gotta clear everything out otherwise a bunch of
+                    // terrible corruption happens and it all explodes. Badly.
                     PixelPerfect.Msg($"Pixel buffer mismatch! Registering new buffer of size: {Width}, {Height}");
                     RegisterBuffer();
                     return;
                 }
 
-                lock (lockObj)
-                {
-                    queuedFrames.Add((AsyncGPUReadback.Request(tex, 0), tex, Width, Height));
-                }
+                // Add a frame to the queue where it will used as it's completed.
+                queuedFrames.Add((AsyncGPUReadback.Request(tex, 0), tex, Width, Height));
             }
         }
         catch (Exception ex)
@@ -146,37 +182,63 @@ public class RenderCapturer : IDisposable
         }
     }
 
+
+
+    /// <summary>
+    /// Tries to get the render texture, if any.
+    /// </summary>
+    /// <param name="tex">The texture, if retrieved.</param>
+    /// <returns></returns>
     public bool TryGetRenderTexture(out RenderTexture tex)
     {
         tex = (provider.Asset?.Connector as RenderTextureConnector)?.RenderTexture!;
         return tex != null;
     }
 
-    public void RegisterBuffer()
+
+
+    /// <summary>
+    /// Halts all activity, then registers a new buffer and frame queue to avoid corruption.
+    /// </summary>
+    private void RegisterBuffer()
     {
-        lock (lockObj)
+        // Complete the adding and nudge the ticker so that if the thread is stalled, it will return when it sees that the collection is finished.
+        queuedFrames.CompleteAdding();
+        ticker.Set();
+
+
+        // Wait for the frame processor
+        try
         {
-            queuedFrames.CompleteAdding();
-            ticker.Set();
             frameProcessor.Wait();
-
-            pixelBuffer.Release();
-            pixelBuffer = new(Width, Height, 0, RenderTextureFormat.BGRA32);
-
-            queuedFrames = new BlockingCollection<(AsyncGPUReadbackRequest req, RenderTexture tex, int width, int height)>(/* MAX_FRAME_PROCESS_COUNT */);
-            frameProcessor = Task.Run(ProcessFrames, tkSrc.Token);
         }
+        catch(AggregateException agx)
+        {
+            PixelPerfect.Msg($"Exception when waiting for the frame processor to halt! Exception: {agx}");
+        }
+
+
+        // Make a new frame queue and restart the frame processor.
+        queuedFrames = new BlockingCollection<(AsyncGPUReadbackRequest req, RenderTexture tex, int width, int height)>(/* MAX_FRAME_PROCESS_COUNT */);
+        frameProcessor = Task.Run(ProcessFrames);
     }
     
+
+
+    /// <summary>
+    /// Disposes of all managed resources contained in this object.
+    /// </summary>
     public void Dispose()
     {
-        queuedFrames.CompleteAdding();
-        tkSrc.Cancel();
-
+        // Unsubscribe the update loop and remove the provider from the capturer dictionary.
         PixelPerfect.Update -= UpdateNDI;
-        pixelBuffer.Release();
         caps.Remove(provider);
 
+
+        // Halt the frame queue to cancel/abort the task.
+        queuedFrames.CompleteAdding();
+
+        // Watit for the processor to finish.
         try
         {
             frameProcessor.Wait();
@@ -185,101 +247,12 @@ public class RenderCapturer : IDisposable
         {
             ex.Handle(e => e is TaskCanceledException);
         }
-        finally
+        finally // Dispose of a bunch of garbage now.
         {
-            tkSrc.Dispose();
             sender.Dispose();
-            provider.Asset?.Connector?.Unmark();
+            provider.Asset?.Connector?.UnmarkBGRA();
+            provider.MarkChangeDirty();
             PixelPerfect.Msg("Render capturer disposed of successfully!");
         }
     }
 }
-
-/*
-public static class VideoSender
-{
-    public static bool init = false;
-    private static readonly Sender sender = new("Pixel-Perfect", false);
-    private static RenderTexture? temp;
-    private static RenderTexture? from;
-    private static NativeArray<byte> buf;
-    private static readonly object _lock = new();
-
-    public static void SetTexture(UnityEngine.Camera cam)
-    {
-        lock (_lock)
-        {
-            var tex = cam.targetTexture;
-            from = tex;
-            temp = new(tex.width, tex.height, 32, RenderTextureFormat.BGRA32);
-            
-            buf = new(tex.width * tex.height * 4, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
-        }
-    }
-
-    public static void UnsetTexture()
-    {
-        lock (_lock)
-        {
-            buf.Dispose();
-            temp = null;
-        }
-    }
-
-    public static void SendFrame()
-    {
-        // PixelPerfect.Msg("Setting render texture");
-
-        // ScreenCapture.CaptureScreenshotIntoRenderTexture(temp);
-
-        // PixelPerfect.Msg("Requesting GPU readback...");
-        lock (_lock)
-        {
-            if (temp == null)
-                return;
-            
-            Graphics.Blit(from, temp);
-            AsyncGPUReadback.RequestIntoNativeArray(ref buf, temp, 0, Callback);
-            // flag = true;
-        }
-
-        // PixelPerfect.Msg("Setting render texture back");
-    }
-    public static void GPURequest(AsyncGPUReadbackRequest req)
-    {
-        if (req.hasError)
-        {
-            PixelPerfect.Msg("Async GPU readback failed!");
-            return;
-        }
-        Task.Run(() => Callback(req)).ConfigureAwait(false);
-    }
-
-    public static unsafe void Callback(AsyncGPUReadbackRequest req)
-    {
-        lock (_lock)
-        {
-            if (temp == null)
-                return;
-            
-            IntPtr ptr = (IntPtr)req.GetData<byte>().GetUnsafePtr();
-            int stride = (temp.width * 32 + 7) / 8;
-
-            using VideoFrame frame = new
-            (
-                ptr,
-                temp.width,
-                temp.height,
-                stride,
-                NDIlib.FourCC_type_e.FourCC_type_BGRA,
-                (float)temp.width / temp.height,
-                60,
-                1,
-                NDIlib.frame_format_type_e.frame_format_type_progressive
-            );
-
-            sender.Send(frame);
-        }
-    }
-}
-*/
