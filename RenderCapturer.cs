@@ -202,25 +202,29 @@ public class RenderCapturer : IDisposable
     /// </summary>
     private void RegisterBuffer()
     {
-        // Complete the adding and nudge the ticker so that if the thread is stalled, it will return when it sees that the collection is finished.
-        queuedFrames.CompleteAdding();
-        ticker.Set();
-
-
-        // Wait for the frame processor
-        try
+        if (TryGetRenderTexture(out var curTex))
         {
-            frameProcessor.Wait();
-        }
-        catch(AggregateException agx)
-        {
-            PixelPerfect.Msg($"Exception when waiting for the frame processor to halt! Exception: {agx}");
-        }
+            // Complete the adding and nudge the ticker so that if the thread is stalled, it will return when it sees that the collection is finished.
+            queuedFrames.CompleteAdding();
+            ticker.Set();
 
 
-        // Make a new frame queue and restart the frame processor.
-        queuedFrames = new BlockingCollection<(AsyncGPUReadbackRequest req, RenderTexture tex, int width, int height)>(/* MAX_FRAME_PROCESS_COUNT */);
-        frameProcessor = Task.Run(ProcessFrames);
+            // Wait for the frame processor
+            try
+            {
+                frameProcessor.Wait();
+            }
+            catch(AggregateException agx)
+            {
+                PixelPerfect.Msg($"Exception when waiting for the frame processor to halt! Exception: {agx}");
+            }
+
+
+            // Make a new frame queue and restart the frame processor.
+            queuedFrames = new BlockingCollection<(AsyncGPUReadbackRequest req, RenderTexture tex, int width, int height)>(/* MAX_FRAME_PROCESS_COUNT */);
+            frameProcessor = Task.Run(ProcessFrames);
+            lastTex = curTex;
+        }
     }
     
 
@@ -230,15 +234,14 @@ public class RenderCapturer : IDisposable
     /// </summary>
     public void Dispose()
     {
-        // Unsubscribe the update loop and remove the provider from the capturer dictionary.
+        // Unsubscribe the update loop
         PixelPerfect.Update -= UpdateNDI;
-        caps.Remove(provider);
 
-
-        // Halt the frame queue to cancel/abort the task.
+        // Halt the frame queue to cancel/abort the task and nudge the frame processor to allow for completion.
         queuedFrames.CompleteAdding();
+        ticker.Set();
 
-        // Watit for the processor to finish.
+        // Wait for the processor to finish.
         try
         {
             frameProcessor.Wait();
@@ -252,6 +255,7 @@ public class RenderCapturer : IDisposable
             sender.Dispose();
             provider.Asset?.Connector?.UnmarkBGRA();
             provider.MarkChangeDirty();
+            caps.Remove(provider);
             PixelPerfect.Msg("Render capturer disposed of successfully!");
         }
     }
